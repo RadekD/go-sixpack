@@ -89,6 +89,13 @@ func WithUserAgent(userAgent string) Option {
 	}
 }
 
+//WithKPI sets kpi param
+func WithKPI(kpi string) Option {
+	return func(params url.Values) {
+		params.Set("kpi", kpi)
+	}
+}
+
 //Client defines basic Sixpack functions
 type Client interface {
 	Participate(name string, opts ...Option) (string, error)
@@ -192,7 +199,7 @@ const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 func randomClientID(n int) string {
 	b := make([]byte, n)
 	for i := range b {
-		b[i] = letterBytes[rand.Int63()%int64(len(letterBytes))]
+		b[i] = letterBytes[src.Int63()%int64(len(letterBytes))]
 	}
 	return string(b)
 }
