@@ -2,202 +2,197 @@ package sixpack
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/ioutil"
-	"net"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"regexp"
 	"time"
-
-	"github.com/nu7hatch/gouuid"
 )
-
-/*
-
-	test := sixpack.Test{
-		URL: "http://localhost:8000",
-		Name: "my-test",
-		Alternatives: []string{"a", "b", "c"},
-		Fraction: 0.1,
-	}
-
-*/
 
 var expRe = regexp.MustCompile(`^[a-z0-9][a-z0-9\-_ ]*$`)
 
-type Test struct {
-	URL          string
-	Name         string
-	Alternatives []string
-	Fraction     float32
+//Option define option type
+type Option func(params url.Values)
+
+//WithAlternatives sets traffic_fraction param
+func WithAlternatives(alternatives ...string) Option {
+	return func(params url.Values) {
+		if len(alternatives) < 2 {
+			panic("Must specify at least 2 alternatives")
+		}
+
+		for _, alt := range alternatives {
+			if !expRe.MatchString(alt) {
+				panic(fmt.Sprintf("Bad alternative name: %s", alt))
+			}
+			params.Add("alternatives", alt)
+		}
+	}
 }
 
-func (six Test) request(endpoint *url.URL, params url.Values) (string, *Response, error) {
-	def := params.Get("force")
-	if def == "" {
-		def = six.Alternatives[0]
+//WithForce sets force param
+func WithForce(alternative string) Option {
+	return func(params url.Values) {
+		if !expRe.MatchString(alternative) {
+			panic(fmt.Sprintf("Bad force name: %s", alternative))
+		}
+		params.Add("force", alternative)
 	}
+}
 
-	timeout := time.Duration(250 * time.Millisecond)
-	transport := http.Transport{
-		Dial: func(network, addr string) (net.Conn, error) {
-			return net.DialTimeout(network, addr, timeout)
-		},
-	}
-	client := &http.Client{
-		Transport: &transport,
-	}
+//WithRequest sets params from http.Request
+func WithRequest(w http.ResponseWriter, r *http.Request) Option {
+	return func(params url.Values) {
+		var clientID string
 
-	baseurl, err := url.Parse(six.URL)
+		cookie, err := r.Cookie("sixpack_client_id")
+		if cookie != nil && err == nil {
+			clientID = cookie.String()
+		} else {
+			clientID = randomClientID(32)
+
+			http.SetCookie(w, &http.Cookie{Name: "sixpack_client_id", Value: clientID, Expires: time.Now().Add(30 * 24 * time.Hour)})
+		}
+
+		WithClientID(clientID)(params)
+		WithIP(r.RemoteAddr)(params)
+		WithUserAgent(r.UserAgent())(params)
+	}
+}
+
+//WithTrafficFraction sets traffic_fraction param
+func WithTrafficFraction(fraction float64) Option {
+	return func(params url.Values) {
+		params.Set("traffic_fraction", fmt.Sprintf("%.2f", fraction))
+	}
+}
+
+//WithClientID sets client_id param
+func WithClientID(clientID string) Option {
+	return func(params url.Values) {
+		params.Set("client_id", clientID)
+	}
+}
+
+//WithIP sets ip_address param
+func WithIP(ip string) Option {
+	return func(params url.Values) {
+		params.Set("ip_address", ip)
+	}
+}
+
+//WithUserAgent sets user_agent param
+func WithUserAgent(userAgent string) Option {
+	return func(params url.Values) {
+		params.Set("user_agent", userAgent)
+	}
+}
+
+//Client defines basic Sixpack functions
+type Client interface {
+	Participate(name string, opts ...Option) (string, error)
+	Convert(name string, opts ...Option) error
+}
+
+func NewClient(baseURL string) (Client, error) {
+	u, err := url.Parse(baseURL)
 	if err != nil {
-		return def, nil, err
+		return nil, err
+	}
+	return &client{
+		baseURL: u,
+	}, nil
+}
+
+type client struct {
+	baseURL *url.URL
+}
+
+func (c *client) Participate(name string, opts ...Option) (string, error) {
+	if !expRe.MatchString(name) {
+		panic("Bad experiment name")
+	}
+	if len(opts) < 1 {
+		panic("Required at least one option")
 	}
 
-	u := baseurl.ResolveReference(endpoint)
-	u.RawQuery = params.Encode()
+	params := url.Values{}
+	params.Set("experiment", name)
+	for _, opt := range opts {
+		opt(params)
+	}
+	if params.Get("alternatives") == "" {
+		panic("WithAlternatives option is required")
+	}
+	if params.Get("client_id") == "" {
+		params.Set("client_id", randomClientID(32))
+	}
 
-	resp, err := client.Get(u.String())
+	return c.do("/participate", params)
+}
+func (c *client) Convert(name string, opts ...Option) error {
+	if !expRe.MatchString(name) {
+		panic("Bad experiment name")
+	}
+	if len(opts) < 1 {
+		panic("Required at least one option")
+	}
+
+	params := url.Values{}
+	params.Set("experiment", name)
+	for _, opt := range opts {
+		opt(params)
+	}
+	if params.Get("client_id") == "" {
+		params.Set("client_id", randomClientID(32))
+	}
+
+	_, err := c.do("/convert", params)
+	return err
+}
+
+func (c *client) do(endpoint string, params url.Values) (string, error) {
+	endpointURL, err := url.Parse(endpoint)
 	if err != nil {
-		return def, nil, err
+		return "", err
+	}
+	reqURL := c.baseURL.ResolveReference(endpointURL)
+	reqURL.RawQuery = params.Encode()
+
+	resp, err := http.Get(reqURL.String())
+	if err != nil {
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	b, err := ioutil.ReadAll(resp.Body)
+	var response struct {
+		Status      string `json:"status"`
+		ClientID    string `json:"client_id"`
+		Alternative struct {
+			Name string `json:"name"`
+		} `json:"alternative"`
+		Experiment struct {
+			Version int    `json:"version"`
+			Name    string `json:"name"`
+		} `json:"experiment"`
+	}
+
+	err = json.NewDecoder(resp.Body).Decode(&response)
 	if err != nil {
-		return def, nil, err
+		return "", err
 	}
-
-	if resp.StatusCode == http.StatusInternalServerError {
-		return def, nil, fmt.Errorf("StatusInternalServerError")
-	}
-	var r *Response
-	err = json.Unmarshal(b, &r)
-	if err != nil {
-		return def, r, err
-	}
-	def = r.Alternative.Name
-	return def, r, err
+	return response.Alternative.Name, nil
 }
 
-func (six Test) Participate(clientID, ip, userAgent, force string) (string, *Response, error) {
-	if len(clientID) == 0 {
-		id, err := uuid.NewV4()
-		if err != nil {
-			return force, nil, err
-		}
-		clientID = id.String()
+var src = rand.NewSource(time.Now().UnixNano())
+
+const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func randomClientID(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letterBytes[rand.Int63()%int64(len(letterBytes))]
 	}
-
-	if !expRe.MatchString(six.Name) {
-		return force, nil, errors.New("Bad experiment name")
-	}
-
-	if len(six.Alternatives) < 2 {
-		return force, nil, errors.New("Must specify at least 2 alternatives")
-	}
-
-	for _, alt := range six.Alternatives {
-		if !expRe.MatchString(alt) {
-			return force, nil, fmt.Errorf("Bad alternative name: %s", alt)
-		}
-	}
-
-	endpoint, _ := url.Parse("/participate")
-
-	params := url.Values{}
-	params.Set("client_id", clientID)
-	if ip != "" {
-		params.Set("ip_address", ip)
-	}
-	if userAgent != "" {
-		params.Set("user_agent", userAgent)
-	}
-	params.Set("experiment", six.Name)
-	params.Set("traffic_fraction", fmt.Sprintf("%.2f", six.Fraction))
-	if force != "" {
-		params.Set("force", force)
-	}
-
-	for _, alt := range six.Alternatives {
-		params.Add("alternatives", alt)
-	}
-
-	return six.request(endpoint, params)
-}
-
-func (six Test) ParticipateFromRequest(w http.ResponseWriter, r *http.Request) (string, *Response, error) {
-	var clientID string
-
-	cookie, err := r.Cookie("sixpack_client_id")
-	if cookie != nil && err == nil {
-		clientID = cookie.String()
-	} else {
-		id, _ := uuid.NewV4()
-		clientID = id.String()
-		http.SetCookie(w, &http.Cookie{Name: "sixpack_client_id", Value: clientID, Expires: time.Now().Add(30 * 24 * time.Hour)})
-	}
-	ip := r.RemoteAddr
-	userAgent := r.UserAgent()
-	force := r.URL.Query().Get("sixpack-force-" + six.Name)
-
-	return six.Participate(clientID, ip, userAgent, force)
-}
-
-func (six Test) Convert(clientID, ip, userAgent, kpi string) (string, *Response, error) {
-	if len(clientID) == 0 {
-		id, err := uuid.NewV4()
-		if err != nil {
-			return "", nil, err
-		}
-		clientID = id.String()
-	}
-
-	endpoint, _ := url.Parse("/convert")
-
-	params := url.Values{}
-	params.Set("client_id", clientID)
-	if ip != "" {
-		params.Set("ip_address", ip)
-	}
-	if userAgent != "" {
-		params.Set("user_agent", userAgent)
-	}
-	params.Set("experiment", six.Name)
-	if kpi != "" {
-		params.Set("kpi", kpi)
-	}
-
-	return six.request(endpoint, params)
-}
-
-func (six Test) ConvertFromRequest(w http.ResponseWriter, r *http.Request, kpi string) (string, *Response, error) {
-	var clientID string
-
-	cookie, err := r.Cookie("sixpack_client_id")
-	if cookie != nil && err == nil {
-		clientID = cookie.String()
-	} else {
-		id, _ := uuid.NewV4()
-		clientID = id.String()
-		http.SetCookie(w, &http.Cookie{Name: "sixpack_client_id", Value: clientID, Expires: time.Now().Add(30 * 24 * time.Hour)})
-	}
-	ip := r.RemoteAddr
-	userAgent := r.UserAgent()
-
-	return six.Convert(clientID, ip, userAgent, kpi)
-}
-
-//Response is a response from sixpack server
-type Response struct {
-	Status      string `json:"status"`
-	ClientID    string `json:"client_id"`
-	Alternative struct {
-		Name string `json:"name"`
-	} `json:"alternative"`
-	Experiment struct {
-		Version int    `json:"version"`
-		Name    string `json:"name"`
-	} `json:"experiment"`
+	return string(b)
 }
